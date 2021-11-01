@@ -1,0 +1,222 @@
+---
+title: "Landscape Ecology Project draft"
+author: "Mark Hill"
+date: "10/31/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Warning: need Rtools to build packages, then run `sdm::installALL()` to make sure all the models are available
+```{r, results='hide'}
+options(java.parameters = "-Xmx8g")
+```
+
+
+We are going to use two different packages to execute the species distribution models: sdm and dismo
+```{r, message=FALSE}
+library(dismo)
+library(dplyr)
+library(raster)
+library(tidyverse)
+library(maps)
+library(maptools)
+library(usdm)
+library(sdm)
+
+```
+# SDM for invasive species Adelges Tsugae 
+
+The aim is to build a layer of suitability for the host of obligate parasite hemlock wooly adelgid to them use in MaxEnt species distribution model that would suggest sites with a high probability of infestation.
+
+# Occurrence data 
+It is easy to gather occurrences right from R with `dismo::gbif()`. First we designate our area of interest so we don't download a bazillion records. We are going to grab records for both species of Hemlock that grow on the east coast as they both are susceptible to the parasite of concern. These records are also filtered to include only geolocated human observations.  
+
+```{r, results='hold', message=FALSE}
+ext <- extent(-85, -80, 34, 37)
+tsuga <- gbif("Tsuga","canadensis",ext=ext,download=T, geo=T)
+tsugaC <- gbif("Tsuga","caroliniana",ext=ext,download=T, geo=T)
+tsuga <- bind_rows(tsuga,tsugaC)
+tsuga <- filter(tsuga, basisOfRecord %in% c("HUMAN_OBSERVATION"))
+tsuga <- select(tsuga,lon,lat)
+tsuga$species <- 1
+coordinates(tsuga) <- c("lon","lat")
+
+rm(tsugaC)
+
+adelges <- gbif("Adelges","tsugae", ext= ext, download= T, geo= T)
+adelges <- filter(adelges, basisOfRecord %in% c("HUMAN_OBSERVATION"))
+adelges <- select(adelges, lon, lat)
+adelges$species <- 1
+coordinates(adelges) <- c("lon", "lat")
+
+```
+This leaves us with a sufficient set of records for both the host and parasite.
+```{r, results='hold'}
+length(tsuga)
+length(adelges)
+```
+Before moving on we should take a peek to make sure they are where they should be.
+```{r}
+data(wrld_simpl)
+plot(wrld_simpl,
+     #xlim=c(-100,-58), ylim=c(30,55), 
+     axes=TRUE, col="light yellow")
+box()
+points(tsuga, adelges, col= "red")
+```
+
+At this scale it sort of hard to tell but they are all in the extent and there are no errant records out in Europe.
+
+# Environmental predictors
+As a start, I've included the bioclim variables, a digital elevation model, and two derived layers from the DEM: slope and aspect. Bioclim is rather straightforward but the DEM takes a little work to stitch the tiles together then crop to southern Appalachia aoi. Surely some of these tiles could be left off because they fall entirely outside the aoi.
+
+### Climate
+
+```{r}
+clim_predictors <- raster::getData('worldclim', var='bio', res=2.5)
+clim_predictors <- crop(clim_predictors, ext)
+plot(clim_predictors)
+```
+
+### DEM
+```{r}
+topo0 <- raster::getData('SRTM', lon= -85, lat= 35)
+topo1 <- raster::getData('SRTM', lon= -86, lat= 33)
+topo2 <- raster::getData('SRTM', lon= -86, lat= 36)
+topo3 <- raster::getData('SRTM', lon= -85, lat= 36)
+topo4 <- raster::getData('SRTM', lon= -79, lat= 36)
+topo5 <- raster::getData('SRTM', lon= -79, lat= 41)
+topo6 <- raster::getData('SRTM', lon= -82, lat= 41)
+topo7 <- raster::getData('SRTM', lon= -77, lat= 33)
+topo8 <- raster::getData('SRTM', lon= -87, lat= 42)
+
+DEM <- merge(topo0,topo1,topo2,topo3,topo4,topo5,topo6,topo7,topo8)
+
+DEM <- crop(DEM, ext)
+plot(DEM)
+map('state', add=TRUE)
+#calculate aspect from DEM
+DEM_asp <- terrain(DEM, opt= "aspect")
+#calculate slope from DEM
+DEM_slp <- terrain(DEM, opt= "slope")
+```
+
+This leaves us with layers of two different resolutions though. Enter `raster::resample`. I don't really know if should be doing this differently (eg changing the bioclim to finer res while also changing DEM to more coarse and meet in the middle sort of). So, make sure the whole raster brick has the same resolution and slap it all together.
+
+```{r}
+predictors_DEMres <- resample(clim_predictors, DEM, method='bilinear')
+predictors <- addLayer(predictors_DEMres, DEM, DEM_asp, DEM_slp)
+names(predictors)[20] <- 'DEM'
+
+```
+
+
+Almost there! Since i sort of threw everything at wall to see what stuck with regard to predictors, we'll use a helper function from `package::usdm` to sort any multicolinearity between our predictors as im using regression type analysis to create a habitat suitablity for the host species.
+```{r}
+locations <- raster::extract(predictors, tsuga)
+v <- vifstep(locations)
+predictors <- exclude(predictors,v)
+```
+
+`sdm::sdm` wants the data used in the model wrapped up in a special little package so there is one more step in data preparation.  
+```{r, message=FALSE}
+dat <- sdmData(species~., tsuga, predictors = predictors, 
+               bg = list(method= "gRandom", n= 999))
+```
+
+```{r, echo=FALSE, message=FALSE}
+# clean up environment so we don't run out of memory
+rm(list = ls(pattern = "topo"))
+rm(clim_predictors, DEM, predictors_DEMres, DEM_asp, DEM_slp, locations)
+gc()
+```
+
+
+# Host model
+
+Mostly for the sake of this not taking FOREVER I'm gonna run the more simple algorithms a few times then stitch them together to create our input for parasite analysis. Which methods to use should be revisited and considered more carefully.
+
+```{r, message=FALSE}
+system.time(
+  {model <- sdm(species~., dat, methods = c("glm", "bioclim"),
+             replication= 'sub', test.percent= 30, n=3,
+             parallelSettings=list(ncore=10, method="parallel"))
+              }
+            )
+```
+
+```{r}
+model
+```
+Then I'll use the weighted average of these for later.
+
+```{r, results='hold'}
+system.time(
+  {magic <- ensemble(model, predictors, 
+                  setting = list(method="weighted", stat="tss", opt=2)
+                  )
+  }
+)
+
+
+plot(magic)
+points(tsuga)
+
+```
+
+# Target Species Model
+
+First, we will start by adding the previously produced host probability surface to the predictors used in the adelgid model. Here we are still using the smaller predictor set, yet not using regression.. who? what you mean multicolinearity?
+```{r}
+adelgidpredictors <- addLayer(predictors, magic)
+names(adelgidpredictors)[11] <- 'tsuga_ensemble'
+```
+
+Next, we aren't using `package::sdm` to run MaxEnt. Before `sdm::sdmData` was making background or pseudo-absences for us but i'll need to do that manually here so we can run some model validation in a minute.
+```{r}
+set.seed(1)
+
+group <- kfold(adelges, 5)
+pres_train <- adelges[group != 1, ]
+pres_test <- adelges[group == 1, ]
+
+backg_test <- randomPoints(adelgidpredictors, n=500, ext=ext, extf = 1.25)
+colnames(backg_test) = c('lon', 'lat')
+```
+
+### Get 'er done!
+
+Eventually i'll probably implement the ensemble approach here too once i hammer out all the appropriate steps and find a computer that will handle it.
+```{r, results='hold'}
+system.time(
+  {adelgidmodel <- dismo::maxent(adelgidpredictors, pres_train)
+
+adelgidmodel
+plot(adelgidmodel)
+
+adelgidsuitability <- predict(adelgidmodel, adelgidpredictors)
+
+#writeRaster(adelgidsuitability, "adelgidSuitability", overwrite=TRUE)
+
+
+plot(adelgidsuitability)
+points(adelges, pch=3)
+map('state', add= TRUE)
+title("Adelgid suitability w/ occurences")
+
+  }
+)
+```
+
+### model evaluation
+
+```{r}
+test <- evaluate(pres_test, backg_test, adelgidmodel, adelgidpredictors)
+test
+plot(test, 'ROC')
+```
+
